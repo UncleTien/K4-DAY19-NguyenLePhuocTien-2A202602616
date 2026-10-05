@@ -116,28 +116,66 @@ class MeteredLLM:
 
     def chat(self, prompt: str, json_mode: bool = False) -> str:
         start = time.perf_counter()
-        if self.chat_provider == "anthropic":
-            text, model, tokens_in, tokens_out = self._chat_anthropic(prompt)
-        else:
-            if json_mode and self.chat_provider != "gemini":
-                response = self._chat_client.chat.completions.create(
-                    model=self.chat_model_id,
-                    messages=[{"role": "user", "content": prompt}],
-                    temperature=0,
-                    response_format={"type": "json_object"},
+        max_retries = 5
+
+        for attempt in range(max_retries):
+            try:
+                if self.chat_provider == "anthropic":
+                    text, model, tokens_in, tokens_out = self._chat_anthropic(prompt)
+
+                else:
+                    if json_mode and self.chat_provider != "gemini":
+                        response = self._chat_client.chat.completions.create(
+                            model=self.chat_model_id,
+                            messages=[{"role": "user", "content": prompt}],
+                            temperature=0,
+                            response_format={"type": "json_object"},
+                        )
+                    else:
+                        response = self._chat_client.chat.completions.create(
+                            model=self.chat_model_id,
+                            messages=[{"role": "user", "content": prompt}],
+                            temperature=0,
+                        )
+
+                    text = response.choices[0].message.content or ""
+                    model = self.chat_model_id
+
+                    usage = response.usage
+                    tokens_in = usage.prompt_tokens if usage else 0
+                    tokens_out = usage.completion_tokens if usage else 0
+
+                # Chỉ tính usage khi request thành công
+                self.usage += Usage(
+                    1,
+                    tokens_in,
+                    tokens_out,
+                    price(model, tokens_in, tokens_out),
+                    time.perf_counter() - start,
                 )
-            else:
-                response = self._chat_client.chat.completions.create(
-                    model=self.chat_model_id,
-                    messages=[{"role": "user", "content": prompt}],
-                    temperature=0,
+
+                return _strip_fences(text) if json_mode else text
+
+            except Exception as exc:
+                # Chỉ retry khi gặp rate limit
+                if "429" not in str(exc) and "RESOURCE_EXHAUSTED" not in str(exc):
+                    raise
+
+                if attempt == max_retries - 1:
+                    raise
+
+                # Gemini chat free tier hiện giới hạn request/phút.
+                # Traceback vừa rồi yêu cầu retry sau khoảng 42 giây.
+                wait_seconds = 50
+
+                print(
+                    f"[chat] Rate limit, đợi {wait_seconds}s "
+                    f"rồi thử lại ({attempt + 1}/{max_retries})..."
                 )
-            text, model = response.choices[0].message.content or "", self.chat_model_id
-            usage = response.usage
-            tokens_in = usage.prompt_tokens if usage else 0
-            tokens_out = usage.completion_tokens if usage else 0
-        self.usage += Usage(1, tokens_in, tokens_out, price(model, tokens_in, tokens_out), time.perf_counter() - start)
-        return _strip_fences(text) if json_mode else text
+
+                time.sleep(wait_seconds)
+
+        raise RuntimeError("Chat failed after retries")
 
     def _chat_anthropic(self, prompt: str) -> tuple[str, str, int, int]:
         # Claude Opus 5.5: thinking is always on and sampling params are removed; effort is the cost lever.
@@ -157,10 +195,34 @@ class MeteredLLM:
         return text, response.model, response.usage.input_tokens, response.usage.output_tokens
 
     def embed(self, text: str) -> list[float]:
-        start = time.perf_counter()
-        response = self._embed_client.embeddings.create(model=self.embed_model_id, input=text)
-        tokens = getattr(response.usage, "prompt_tokens", 0) or 0   # some OpenAI-compatible APIs omit usage
-        self.usage += Usage(1, tokens, 0, price(self.embed_model_id, tokens), time.perf_counter() - start)
-        return [float(value) for value in response.data[0].embedding]
+        max_retries = 5
 
+        for attempt in range(max_retries):
+            try:
+                response = self._embed_client.embeddings.create(
+                    model=self.embed_model_id,
+                    input=text,
+                )
+
+                self.usage.calls += 1
+                return response.data[0].embedding
+
+            except Exception as exc:
+                # Retry only for rate-limit errors
+                if "429" not in str(exc) and "RESOURCE_EXHAUSTED" not in str(exc):
+                    raise
+
+                if attempt == max_retries - 1:
+                    raise
+
+                wait_seconds = 20
+
+                print(
+                    f"[embedding] Rate limit, đợi {wait_seconds}s "
+                    f"rồi thử lại ({attempt + 1}/{max_retries})..."
+                )
+
+                time.sleep(wait_seconds)
+
+        raise RuntimeError("Embedding failed after retries")
     __call__ = embed
